@@ -1,0 +1,503 @@
+package org.infernus.idea.checkstyle.ui;
+
+import com.intellij.openapi.fileChooser.FileChooser;
+import com.intellij.openapi.fileChooser.FileChooserDescriptor;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ProjectUtil;
+import com.intellij.openapi.ui.ComboBox;
+import com.intellij.openapi.vfs.LocalFileSystem;
+import com.intellij.openapi.vfs.VfsUtilCore;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.search.scope.packageSet.NamedScope;
+import com.intellij.util.ui.JBUI;
+import org.infernus.idea.checkstyle.CheckStyleBundle;
+import org.infernus.idea.checkstyle.csapi.BundledConfig;
+import org.infernus.idea.checkstyle.model.BundledConfigurationLocation;
+import org.infernus.idea.checkstyle.model.ConfigurationLocation;
+import org.infernus.idea.checkstyle.model.ConfigurationLocationFactory;
+import org.infernus.idea.checkstyle.model.ConfigurationType;
+import org.infernus.idea.checkstyle.model.NamedScopeHelper;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.io.File;
+import java.io.Serial;
+import java.nio.file.Paths;
+import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
+
+import static org.infernus.idea.checkstyle.model.ConfigurationType.*;
+import static org.infernus.idea.checkstyle.ui.LocationPanel.LocationType.*;
+import static org.infernus.idea.checkstyle.util.Strings.isBlank;
+
+public class LocationPanel extends JPanel {
+
+    enum LocationType {
+        FILE, HTTP, CLASSPATH, BUILT_IN
+    }
+
+    private static final Insets COMPONENT_INSETS = JBUI.insets(4);
+
+    private final JButton browseButton = new JButton(new BrowseAction());
+    private final JLabel fileLocationLabel = new JLabel(CheckStyleBundle.message("config.file.file.label"));
+    private final JLabel urlLocationLabel = new JLabel(CheckStyleBundle.message("config.file.url.label"));
+    private final JLabel classpathLocationLabel = new JLabel(CheckStyleBundle.message("config.file.classpath.label"));
+    private final JTextField fileLocationField = new JTextField(20);
+    private final JTextField urlLocationField = new JTextField(20);
+    private final JTextField classpathLocationField = new JTextField(20);
+    private final JRadioButton fileLocationRadio = new JRadioButton();
+    private final JRadioButton urlLocationRadio = new JRadioButton();
+    private final JRadioButton classpathLocationRadio = new JRadioButton();
+    private final JRadioButton builtInLocationRadio = new JRadioButton();
+    private final JLabel builtInLocationLabel = new JLabel(CheckStyleBundle.message("config.file.built-in.label"));
+    private final ComboBox<BundledConfig> builtInComboBox = new ComboBox<>();
+    private final JTextField descriptionField = new JTextField();
+    private final ComboBox<NamedScope> scopeComboBox = new ComboBox<>();
+    private final JCheckBox relativeFileCheckbox = new JCheckBox();
+    private final JCheckBox insecureHttpCheckbox = new JCheckBox();
+    private final JLabel classpathLocationReminderLabel = new JLabel();
+
+    private final Project project;
+
+    public LocationPanel(final Project project) {
+        super(new GridBagLayout());
+
+        if (project == null) {
+            throw new IllegalArgumentException("Project may not be null");
+        }
+        this.project = project;
+
+        initialise();
+    }
+
+    private void initialise() {
+        relativeFileCheckbox.setText(CheckStyleBundle.message("config.file.relative-file.text"));
+        relativeFileCheckbox.setToolTipText(CheckStyleBundle.message("config.file.relative-file.tooltip"));
+        insecureHttpCheckbox.setText(CheckStyleBundle.message("config.file.insecure-http.text"));
+        insecureHttpCheckbox.setToolTipText(CheckStyleBundle.message("config.file.insecure-http.tooltip"));
+
+        fileLocationRadio.setText(CheckStyleBundle.message("config.file.file.text"));
+        fileLocationRadio.addActionListener(new RadioButtonActionListener());
+        urlLocationRadio.setText(CheckStyleBundle.message("config.file.url.text"));
+        urlLocationRadio.addActionListener(new RadioButtonActionListener());
+        classpathLocationRadio.setText(CheckStyleBundle.message("config.file.classpath.text"));
+        classpathLocationRadio.addActionListener(new RadioButtonActionListener());
+        classpathLocationReminderLabel.setText(CheckStyleBundle.message("config.file.classpath.reminder"));
+
+        builtInLocationRadio.setText(CheckStyleBundle.message("config.file.built-in.text"));
+        builtInLocationRadio.addActionListener(new RadioButtonActionListener());
+        BundledConfig.getAllBundledConfigs().forEach(builtInComboBox::addItem);
+        builtInComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(final JList<?> list,
+                                                          final Object value,
+                                                          final int index,
+                                                          final boolean isSelected,
+                                                          final boolean cellHasFocus) {
+                var presentableName = ((BundledConfig) value).getDescription();
+                super.getListCellRendererComponent(list, presentableName, index, isSelected, cellHasFocus);
+                return this;
+            }
+        });
+        builtInComboBox.addActionListener(e -> prefillDescriptionFromSelectedBuiltIn());
+
+        final ButtonGroup locationGroup = new ButtonGroup();
+        locationGroup.add(fileLocationRadio);
+        locationGroup.add(urlLocationRadio);
+        locationGroup.add(classpathLocationRadio);
+        locationGroup.add(builtInLocationRadio);
+
+        fileLocationRadio.setSelected(true);
+        enabledLocation(FILE);
+
+        final JLabel descriptionLabel = new JLabel(CheckStyleBundle.message("config.file.description.text"));
+        descriptionField.setToolTipText(CheckStyleBundle.message("config.file.description.tooltip"));
+
+        final JLabel scopeLabel = new JLabel(CheckStyleBundle.message("config.file.scope.label"));
+        NamedScopeHelper.getAllScopes(project).forEach(this.scopeComboBox::addItem);
+        this.scopeComboBox.setSelectedItem(NamedScopeHelper.getDefaultScope(project));
+        this.scopeComboBox.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(final JList<?> list,
+                                                          final Object value,
+                                                          final int index,
+                                                          final boolean isSelected,
+                                                          final boolean cellHasFocus) {
+                var presentableName = ((NamedScope) value).getPresentableName();
+                super.getListCellRendererComponent(list, presentableName, index, isSelected, cellHasFocus);
+                return this;
+            }
+        });
+
+        setBorder(JBUI.Borders.empty(8, 8, 4, 8));
+
+        add(descriptionLabel, new GridBagConstraints(0, 0, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+        add(descriptionField, new GridBagConstraints(1, 0, 2, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+
+        add(fileLocationRadio, new GridBagConstraints(0, 1, 3, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+
+        add(fileLocationLabel, new GridBagConstraints(0, 2, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+        add(fileLocationField, new GridBagConstraints(1, 2, 1, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+        add(browseButton, new GridBagConstraints(2, 2, 1, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+
+        add(relativeFileCheckbox, new GridBagConstraints(1, 3, 2, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+
+        add(urlLocationRadio, new GridBagConstraints(0, 4, 3, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, JBUI.insets(8, 4, 4, 4), 0, 0));
+
+        add(urlLocationLabel, new GridBagConstraints(0, 5, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+        add(urlLocationField, new GridBagConstraints(1, 5, 2, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+
+        add(insecureHttpCheckbox, new GridBagConstraints(1, 6, 2, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+
+        add(classpathLocationRadio, new GridBagConstraints(0, 7, 3, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, JBUI.insets(8, 4, 4, 4), 0, 0));
+
+        add(classpathLocationLabel, new GridBagConstraints(0, 8, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+        add(classpathLocationField, new GridBagConstraints(1, 8, 2, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+        add(classpathLocationReminderLabel, new GridBagConstraints(1, 9, 2, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+
+        add(builtInLocationRadio, new GridBagConstraints(0, 10, 3, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.NONE, JBUI.insets(8, 4, 4, 4), 0, 0));
+
+        add(builtInLocationLabel, new GridBagConstraints(0, 11, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+        add(builtInComboBox, new GridBagConstraints(1, 11, 2, 1, 1.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+
+        add(Box.createVerticalGlue(), new GridBagConstraints(0, 13, 3, 1, 0.0, 1.0,
+                GridBagConstraints.WEST, GridBagConstraints.VERTICAL, COMPONENT_INSETS, 0, 0));
+
+
+        add(scopeLabel, new GridBagConstraints(0, 15, 1, 1, 0.0, 0.0,
+                GridBagConstraints.EAST, GridBagConstraints.NONE, COMPONENT_INSETS, 0, 0));
+
+        add(scopeComboBox, new GridBagConstraints(1, 15, 2, 1, 0.0, 0.0,
+                GridBagConstraints.WEST, GridBagConstraints.HORIZONTAL, COMPONENT_INSETS, 0, 0));
+    }
+
+    private void prefillDescriptionFromSelectedBuiltIn() {
+        if (!isNotBlank(descriptionField.getText())) {
+            final BundledConfig selected = (BundledConfig) builtInComboBox.getSelectedItem();
+            if (selected != null) {
+                descriptionField.setText(selected.getDescription());
+            }
+        }
+    }
+
+    private void enabledLocation(final LocationType locationType) {
+        fileLocationLabel.setEnabled(locationType == FILE);
+        fileLocationField.setEnabled(locationType == FILE);
+        browseButton.setEnabled(locationType == FILE);
+        relativeFileCheckbox.setEnabled(locationType == FILE);
+
+        urlLocationLabel.setEnabled(locationType == HTTP);
+        urlLocationField.setEnabled(locationType == HTTP);
+        insecureHttpCheckbox.setEnabled(locationType == HTTP);
+
+        classpathLocationLabel.setEnabled(locationType == CLASSPATH);
+        classpathLocationField.setEnabled(locationType == CLASSPATH);
+        classpathLocationReminderLabel.setEnabled(locationType == CLASSPATH);
+
+        builtInLocationLabel.setEnabled(locationType == BUILT_IN);
+        builtInComboBox.setEnabled(locationType == BUILT_IN);
+    }
+
+    private ConfigurationType typeOfFile() {
+        if (relativeFileCheckbox.isSelected()) {
+            return PROJECT_RELATIVE;
+        }
+        return LOCAL_FILE;
+    }
+
+    private ConfigurationType typeOfUrl() {
+        if (insecureHttpCheckbox.isSelected()) {
+            return INSECURE_HTTP_URL;
+        }
+        return HTTP_URL;
+    }
+
+    /**
+     * Get the configuration location entered in the dialogue, or null if no valid location was entered.
+     *
+     * @return the location or null if no valid location entered.
+     */
+    public ConfigurationLocation getConfigurationLocation() {
+        final NamedScope namedScope = (NamedScope) scopeComboBox.getSelectedItem();
+        final String newId = UUID.randomUUID().toString();
+
+        if (fileLocationField.isEnabled()) {
+            if (isNotBlank(fileLocation())) {
+                return configurationLocationFactory().create(
+                        project,
+                        newId,
+                        typeOfFile(),
+                        fileLocation(),
+                        descriptionField.getText(),
+                        namedScope);
+            }
+
+        } else if (urlLocationField.isEnabled()) {
+            if (isNotBlank(urlLocation())) {
+                return configurationLocationFactory().create(
+                        project,
+                        newId,
+                        typeOfUrl(),
+                        urlLocation(),
+                        descriptionField.getText(),
+                        namedScope);
+            }
+
+        } else if (classpathLocationField.isEnabled()) {
+            if (isNotBlank(classpathLocation())) {
+                return configurationLocationFactory().create(
+                        project,
+                        newId,
+                        PLUGIN_CLASSPATH,
+                        classpathLocation(),
+                        descriptionField.getText(),
+                        namedScope);
+            }
+
+        } else if (builtInComboBox.isEnabled()) {
+            final BundledConfig selectedBundledConfig = (BundledConfig) builtInComboBox.getSelectedItem();
+            if (selectedBundledConfig != null) {
+                return configurationLocationFactory().create(
+                        project,
+                        newId,
+                        BUNDLED,
+                        selectedBundledConfig.getId(),
+                        descriptionField.getText(),
+                        namedScope);
+            }
+        }
+
+
+        return null;
+    }
+
+    private String urlLocation() {
+        return trim(urlLocationField.getText());
+    }
+
+    private String classpathLocation() {
+        return trim(classpathLocationField.getText());
+    }
+
+    private String fileLocation() {
+        final String filename = trim(fileLocationField.getText());
+
+        if (new File(filename).exists()) {
+            return filename;
+        }
+
+        final File projectRelativePath = projectRelativeFileOf(filename);
+        if (projectRelativePath.exists()) {
+            return projectRelativePath.getAbsolutePath();
+        }
+
+        return filename;
+    }
+
+    private File projectRelativeFileOf(final String filename) {
+        return Paths.get(new File(project.getBasePath(), filename).getAbsolutePath())
+                .normalize()
+                .toAbsolutePath()
+                .toFile();
+    }
+
+    private String trim(final String text) {
+        if (text != null) {
+            return text.trim();
+        }
+        return null;
+    }
+
+    private ConfigurationLocationFactory configurationLocationFactory() {
+        return project.getService(ConfigurationLocationFactory.class);
+    }
+
+    /*
+     * This is a port from commons-lang 2.4, in order to get around the absence of commons-lang in
+     * some packages of IDEA 7.x.
+     */
+    private boolean isNotBlank(final String str) {
+        int strLen;
+        if (str == null || (strLen = str.length()) == 0) {
+            return false;
+        }
+        for (int i = 0; i < strLen; i++) {
+            if (!Character.isWhitespace(str.charAt(i))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * Set the configuration location.
+     *
+     * @param configurationLocation the location.
+     */
+    public void setConfigurationLocation(final ConfigurationLocation configurationLocation) {
+        relativeFileCheckbox.setSelected(false);
+        insecureHttpCheckbox.setSelected(false);
+
+        if (configurationLocation == null) {
+            fileLocationRadio.setSelected(true);
+            fileLocationField.setText(null);
+            enabledLocation(FILE);
+            descriptionField.setText(null);
+
+        } else if (configurationLocation.getType() == LOCAL_FILE
+                || configurationLocation.getType() == PROJECT_RELATIVE) {
+            fileLocationRadio.setSelected(true);
+            fileLocationField.setText(configurationLocation.getLocation());
+            relativeFileCheckbox.setSelected(configurationLocation.getType() == PROJECT_RELATIVE);
+            enabledLocation(FILE);
+            descriptionField.setText(configurationLocation.getDescription());
+
+        } else if (configurationLocation.getType() == HTTP_URL
+                || configurationLocation.getType() == INSECURE_HTTP_URL) {
+            urlLocationRadio.setSelected(true);
+            urlLocationField.setText(configurationLocation.getLocation());
+            insecureHttpCheckbox.setSelected(configurationLocation.getType() == INSECURE_HTTP_URL);
+            enabledLocation(HTTP);
+            descriptionField.setText(configurationLocation.getDescription());
+
+        } else if (configurationLocation.getType() == PLUGIN_CLASSPATH) {
+            classpathLocationRadio.setSelected(true);
+            classpathLocationField.setText(configurationLocation.getLocation());
+            enabledLocation(CLASSPATH);
+            descriptionField.setText(configurationLocation.getDescription());
+
+        } else if (configurationLocation.getType() == BUNDLED) {
+            builtInLocationRadio.setSelected(true);
+            builtInComboBox.setSelectedItem(((BundledConfigurationLocation) configurationLocation).getBundledConfig());
+            enabledLocation(BUILT_IN);
+            descriptionField.setText(configurationLocation.getDescription());
+
+        } else {
+            throw new IllegalArgumentException("Unsupported configuration type: " + configurationLocation.getType());
+        }
+    }
+
+    /**
+     * Disable radio buttons to prevent changing the location type (for edit mode).
+     */
+    public void disableTypeSelection() {
+        fileLocationRadio.setEnabled(false);
+        urlLocationRadio.setEnabled(false);
+        classpathLocationRadio.setEnabled(false);
+        builtInLocationRadio.setEnabled(false);
+    }
+
+    /**
+     * Apply description and location changes to an existing location without creating a new one.
+     *
+     * @param location the location to update in place.
+     */
+    public void applyChangesTo(final ConfigurationLocation location) {
+        location.setDescription(descriptionField.getText());
+        if (fileLocationField.isEnabled() && isNotBlank(fileLocation())) {
+            location.setLocation(fileLocation());
+        } else if (urlLocationField.isEnabled() && isNotBlank(urlLocation())) {
+            location.setLocation(urlLocation());
+        } else if (classpathLocationField.isEnabled() && isNotBlank(classpathLocation())) {
+            location.setLocation(classpathLocation());
+        }
+    }
+
+    JRadioButton builtInLocationRadio() {
+        return builtInLocationRadio;
+    }
+
+    ComboBox<BundledConfig> builtInComboBox() {
+        return builtInComboBox;
+    }
+
+    JTextField descriptionField() {
+        return descriptionField;
+    }
+
+    private final class BrowseAction extends AbstractAction {
+        @Serial
+        private static final long serialVersionUID = -992858528081327052L;
+
+        BrowseAction() {
+            putValue(Action.NAME, CheckStyleBundle.message(
+                    "config.file.browse.text"));
+            putValue(Action.SHORT_DESCRIPTION,
+                    CheckStyleBundle.message("config.file.browse.tooltip"));
+            putValue(Action.LONG_DESCRIPTION,
+                    CheckStyleBundle.message("config.file.browse.tooltip"));
+        }
+
+        @Override
+        public void actionPerformed(final ActionEvent e) {
+            final VirtualFile toSelect;
+            final String configFilePath = fileLocation();
+            if (!isBlank(configFilePath)) {
+                toSelect = LocalFileSystem.getInstance().findFileByPath(configFilePath);
+            } else {
+                toSelect = ProjectUtil.guessProjectDir(project);
+            }
+
+            final VirtualFile chosen = FileChooser.chooseFile(jarFileChooserDescriptor(), LocationPanel.this, project, toSelect);
+            if (chosen != null) {
+                final File newConfigFile = VfsUtilCore.virtualToIoFile(chosen);
+                fileLocationField.setText(newConfigFile.getAbsolutePath());
+            }
+        }
+
+        private static FileChooserDescriptor jarFileChooserDescriptor() {
+            return new FileChooserDescriptor(true, false, false, false, true, false)
+                    .withFileFilter((file) -> {
+                        final String currentExtension = file.getExtension();
+                        return currentExtension != null && Set.of("xml", "checkstyle").contains(currentExtension.trim().toLowerCase(Locale.ENGLISH));
+                    });
+        }
+    }
+
+    /**
+     * Handles radio button selections.
+     */
+    private final class RadioButtonActionListener implements ActionListener {
+        @Override
+        public void actionPerformed(final ActionEvent e) {
+            if (urlLocationRadio.isSelected()) {
+                enabledLocation(HTTP);
+
+            } else if (fileLocationRadio.isSelected()) {
+                enabledLocation(FILE);
+
+            } else if (classpathLocationRadio.isSelected()) {
+                enabledLocation(CLASSPATH);
+
+            } else if (builtInLocationRadio.isSelected()) {
+                enabledLocation(BUILT_IN);
+                prefillDescriptionFromSelectedBuiltIn();
+
+            } else {
+                throw new IllegalStateException("Unknown radio button state");
+            }
+        }
+    }
+}

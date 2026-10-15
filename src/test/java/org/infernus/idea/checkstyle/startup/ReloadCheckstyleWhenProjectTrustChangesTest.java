@@ -1,0 +1,214 @@
+package org.infernus.idea.checkstyle.startup;
+
+import com.intellij.codeInsight.daemon.DaemonCodeAnalyzer;
+import com.intellij.ide.trustedProjects.TrustedProjectsListener;
+import com.intellij.openapi.Disposable;
+import com.intellij.openapi.application.Application;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Condition;
+import com.intellij.util.ThreeState;
+import com.intellij.util.messages.MessageBus;
+import com.intellij.util.messages.MessageBusConnection;
+import kotlin.coroutines.Continuation;
+import org.infernus.idea.checkstyle.CheckstyleProjectService;
+import org.infernus.idea.checkstyle.ConfigurationInvalidator;
+import org.infernus.idea.checkstyle.config.PluginConfiguration;
+import org.infernus.idea.checkstyle.config.PluginConfigurationManager;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.MockedStatic;
+
+import java.util.List;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.*;
+
+@SuppressWarnings("unchecked")
+class ReloadCheckstyleWhenProjectTrustChangesTest {
+
+    private Project project;
+    private Project otherProject;
+    private ConfigurationInvalidator invalidator;
+    private DaemonCodeAnalyzer daemonCodeAnalyzer;
+    private CheckstyleProjectService checkstyleProjectService;
+    private PluginConfiguration pluginConfig;
+    private MessageBusConnection connection;
+    private ReloadCheckstyleWhenProjectTrustChanges.Warner warner;
+    private MockedStatic<ApplicationManager> applicationManager;
+    private Application application;
+    private ThreeState trustState;
+
+    @BeforeEach
+    void setUp() {
+        project = mock(Project.class);
+        otherProject = mock(Project.class);
+        invalidator = mock(ConfigurationInvalidator.class);
+        daemonCodeAnalyzer = mock(DaemonCodeAnalyzer.class);
+        checkstyleProjectService = mock(CheckstyleProjectService.class);
+        connection = mock(MessageBusConnection.class);
+        warner = mock(ReloadCheckstyleWhenProjectTrustChanges.Warner.class);
+        trustState = ThreeState.YES;
+
+        pluginConfig = mock(PluginConfiguration.class);
+        when(pluginConfig.getThirdPartyClasspath()).thenReturn(List.of());
+        PluginConfigurationManager configManager = mock(PluginConfigurationManager.class);
+        when(configManager.getCurrent()).thenReturn(pluginConfig);
+
+        when(project.getService(PluginConfigurationManager.class)).thenReturn(configManager);
+        when(project.getService(ConfigurationInvalidator.class)).thenReturn(invalidator);
+        when(project.getService(DaemonCodeAnalyzer.class)).thenReturn(daemonCodeAnalyzer);
+        when(project.getService(CheckstyleProjectService.class)).thenReturn(checkstyleProjectService);
+        // A real Project never returns null here, and Mockito's any(Condition.class) would not match null.
+        when(project.getDisposed()).thenReturn(o -> project.isDisposed());
+
+        // Scoped and thread-local, so it never installs a global application the way setApplication would.
+        application = mock(Application.class);
+        doAnswer(invocation -> {
+            invocation.getArgument(0, Runnable.class).run();
+            return null;
+        }).when(application).invokeLater(any(Runnable.class), any(Condition.class));
+        applicationManager = mockStatic(ApplicationManager.class);
+        applicationManager.when(ApplicationManager::getApplication).thenReturn(application);
+    }
+
+    @AfterEach
+    void tearDown() {
+        applicationManager.close();
+    }
+
+    private TrustedProjectsListener executeAndCaptureListener() {
+        ReloadCheckstyleWhenProjectTrustChanges activity = new ReloadCheckstyleWhenProjectTrustChanges(
+                parentDisposable -> connection, warner, Runnable::run, p -> trustState);
+        activity.execute(project, mock(Continuation.class));
+
+        ArgumentCaptor<TrustedProjectsListener> listener = ArgumentCaptor.forClass(TrustedProjectsListener.class);
+        verify(connection).subscribe(eq(TrustedProjectsListener.TOPIC), listener.capture());
+        return listener.getValue();
+    }
+
+    @Test
+    void trustingThisProjectInvalidatesCachedResources() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+
+        listener.onProjectTrusted(project);
+
+        verify(invalidator).invalidateCachedResources();
+    }
+
+    @Test
+    void untrustingThisProjectInvalidatesCachedResources() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+
+        listener.onProjectUntrusted(project);
+
+        verify(invalidator).invalidateCachedResources();
+    }
+
+    @Test
+    void trustingADifferentProjectDoesNotInvalidateThisProject() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+
+        listener.onProjectTrusted(otherProject);
+
+        verifyNoInteractions(invalidator);
+    }
+
+    /**
+     * Regression test: the subscription must stay live after a trust event for a foreign project. An
+     * earlier design used the one-shot {@code onceWhenProjectTrusted} helper, which self-disconnects on the
+     * first event for <em>any</em> project - so with two projects open, trusting the other one permanently
+     * broke this one's reactivation.
+     */
+    @Test
+    void aTrustChangeForAnotherProjectDoesNotConsumeThisProjectsSubscription() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+
+        listener.onProjectTrusted(otherProject);
+        listener.onProjectTrusted(project);
+
+        verify(invalidator).invalidateCachedResources();
+    }
+
+    @Test
+    void aTrustChangeRestartsTheDaemonSoHighlightingRefreshes() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+
+        listener.onProjectTrusted(project);
+
+        verify(daemonCodeAnalyzer).restart();
+    }
+
+    @Test
+    void anUntrustedProjectWithThirdPartyJarsConfiguredIsWarnedOnStartup() {
+        when(pluginConfig.getThirdPartyClasspath()).thenReturn(List.of("/some/custom-check.jar"));
+        trustState = ThreeState.NO;
+
+        executeAndCaptureListener();
+
+        verify(warner).showWarning(eq(project), any(String.class));
+    }
+
+    @Test
+    void anUndecidedProjectIsNotWarnedWhileTheTrustDialogIsStillOpen() {
+        when(pluginConfig.getThirdPartyClasspath()).thenReturn(List.of("/some/custom-check.jar"));
+        trustState = ThreeState.UNSURE;
+
+        executeAndCaptureListener();
+
+        verifyNoInteractions(warner);
+    }
+
+    @Test
+    void aTrustedProjectIsNotWarned() {
+        when(pluginConfig.getThirdPartyClasspath()).thenReturn(List.of("/some/custom-check.jar"));
+        trustState = ThreeState.YES;
+
+        executeAndCaptureListener();
+
+        verifyNoInteractions(warner);
+    }
+
+    @Test
+    void anUntrustedProjectWithNoThirdPartyJarsConfiguredIsNotWarned() {
+        when(pluginConfig.getThirdPartyClasspath()).thenReturn(List.of());
+        trustState = ThreeState.NO;
+
+        executeAndCaptureListener();
+
+        verifyNoInteractions(warner);
+    }
+
+    /**
+     * The behavioural tests above all inject a fake {@link
+     * ReloadCheckstyleWhenProjectTrustChanges.ConnectionFactory}, so by construction they cannot notice if the
+     * real wiring regressed to a self-disconnecting one-shot subscription, nor if it used the {@code Project}
+     * as the parent disposable - which JetBrains explicitly prohibits, as it leaks the plugin's classloader
+     * across a dynamic unload. This test exercises the production default instead.
+     */
+    @Test
+    void theProductionWiringSubscribesForTheProjectServicesLifetimeAndNeverDisconnects() {
+        MessageBus messageBus = mock(MessageBus.class);
+        when(messageBus.connect(any(Disposable.class))).thenReturn(connection);
+        when(application.getMessageBus()).thenReturn(messageBus);
+
+        new ReloadCheckstyleWhenProjectTrustChanges().execute(project, mock(Continuation.class));
+
+        verify(messageBus).connect(checkstyleProjectService);
+        verify(connection).subscribe(eq(TrustedProjectsListener.TOPIC), any(TrustedProjectsListener.class));
+        verify(connection, never()).disconnect();
+    }
+
+    @Test
+    void aTrustChangeForAnAlreadyDisposedProjectIsIgnored() {
+        TrustedProjectsListener listener = executeAndCaptureListener();
+        when(project.isDisposed()).thenReturn(true);
+
+        listener.onProjectTrusted(project);
+
+        verifyNoInteractions(invalidator);
+    }
+}

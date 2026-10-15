@@ -1,0 +1,108 @@
+package org.infernus.idea.checkstyle.model;
+
+import com.intellij.openapi.project.Project;
+import org.infernus.idea.checkstyle.csapi.BundledConfig;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.io.IOException;
+import java.io.InputStream;
+
+import static org.infernus.idea.checkstyle.util.Streams.inMemoryCopyOf;
+
+
+public class BundledConfigurationLocation extends ConfigurationLocation {
+    @NotNull
+    private final BundledConfig bundledConfig;
+
+    BundledConfigurationLocation(@NotNull final BundledConfig bundledConfig,
+                                 @NotNull final Project project) {
+        this(bundledConfig.getId(), bundledConfig, project);
+    }
+
+    BundledConfigurationLocation(@NotNull final String id,
+                                 @NotNull final BundledConfig bundledConfig,
+                                 @NotNull final Project project) {
+        super(id, ConfigurationType.BUNDLED, project);
+        super.setLocation(bundledConfig.getId());
+        super.setDescription(bundledConfig.getDescription());
+
+        this.bundledConfig = bundledConfig;
+    }
+
+    @NotNull
+    public BundledConfig getBundledConfig() {
+        return bundledConfig;
+    }
+
+    @Override
+    public void setLocation(final String location) {
+        // do nothing, we always use the hard-coded location
+    }
+
+    @Override
+    public void setDescription(@Nullable final String description) {
+        super.setDescription(description);
+    }
+
+    @Override
+    @NotNull
+    protected InputStream resolveFile(@NotNull final ClassLoader checkstyleClassLoader) throws IOException {
+        try {
+            InputStream source = checkstyleClassLoader.loadClass("com.puppycrawl.tools.checkstyle.Checker").getResourceAsStream(bundledConfig.getPath());
+            if (source == null) {
+                throw new IOException("Could not read " + bundledConfig.getPath() + " from classpath");
+            }
+            return inMemoryCopyOf(source);
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Couldn't find Checkstyle on classpath", e);
+        }
+    }
+
+    public boolean isRemovable() {
+        return !getId().equals(bundledConfig.getId());
+    }
+
+    @Override
+    protected boolean isPrioritySortOrder() {
+        return true;
+    }
+
+    @Override
+    protected BundledConfig additionalHashCodeComponents() {
+        return bundledConfig;
+    }
+
+    @Override
+    protected int compareForPrioritySortOrder(@NotNull final ConfigurationLocation other) {
+        final BundledConfigurationLocation that = (BundledConfigurationLocation) other;
+
+        int result = Integer.compare(bundledConfig.getSortOrder(), that.bundledConfig.getSortOrder());
+        if (result == 0) {
+            result = compareNullable(getDescription(), that.getDescription());
+        }
+        if (result == 0) {
+            result = compareNullable(getId(), that.getId());
+        }
+        return result;
+    }
+
+    private static int compareNullable(@Nullable final String left, @Nullable final String right) {
+        if (left == null) {
+            return right == null ? 0 : -1;
+        }
+        if (right == null) {
+            return 1;
+        }
+        return left.compareTo(right);
+    }
+
+
+    @Override
+    @NotNull
+    public BundledConfigurationLocation clone() {
+        BundledConfigurationLocation cloned = new BundledConfigurationLocation(getId(), bundledConfig, getProject());
+        cloneCommonPropertiesTo(cloned);
+        return cloned;
+    }
+}

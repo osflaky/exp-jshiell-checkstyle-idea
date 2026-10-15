@@ -1,0 +1,99 @@
+package org.infernus.idea.checkstyle.maven;
+
+import com.intellij.ide.plugins.PluginManagerCore;
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.extensions.PluginId;
+import org.infernus.idea.checkstyle.ArtifactRepositoryCredentials;
+import org.infernus.idea.checkstyle.ArtifactRepositoryLocation;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.idea.maven.utils.MavenUtil;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Optional;
+
+/**
+ * Resolves a Maven Central mirror URL from the user's Maven {@code settings.xml}, if the bundled Maven
+ * plugin is available and a mirror applies. This is the only class the artifact download path references
+ * that touches {@code org.jetbrains.idea.maven.*} classes, so {@link org.infernus.idea.checkstyle.ArtifactDownloadBaseUrlResolver}
+ * can safely guard against the optional dependency being absent by catching any {@link Throwable} around
+ * calls into this class - no such symbol crosses into its own bytecode.
+ */
+public final class MavenMirrorUrlResolver {
+
+    private static final Logger LOG = Logger.getInstance(MavenMirrorUrlResolver.class);
+    private static final String MAVEN_PLUGIN_ID = "org.jetbrains.idea.maven";
+    private static final String CENTRAL_REPOSITORY_URL = "https://repo1.maven.org/maven2/";
+    private static final String CENTRAL_REPOSITORY_ID = "central";
+
+    private MavenMirrorUrlResolver() {
+    }
+
+    @NotNull
+    public static Optional<ArtifactRepositoryLocation> resolveCentralMirrorWithCredentials() {
+        Optional<Path> settingsFile = currentUserSettingsPath();
+        return settingsFile.flatMap(path -> resolveCentralMirrorWithCredentialsFromSettings(
+                path, MavenServerCredentialsResolver.defaultSettingsSecurityPath()));
+    }
+
+    @NotNull
+    static Optional<ArtifactRepositoryLocation> resolveCentralMirrorWithCredentialsFromSettings(
+            @NotNull final Path settingsFile, @NotNull final Path settingsSecurityFile) {
+        Optional<String> mirrorUrl = resolveCentralMirrorFromSettings(settingsFile);
+        if (mirrorUrl.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<ArtifactRepositoryCredentials> credentials = MavenServerCredentialsResolver
+                .resolveCredentialsForMirror(settingsFile, settingsSecurityFile, mirrorUrl.get());
+        return Optional.of(new ArtifactRepositoryLocation(mirrorUrl.get(), credentials));
+    }
+
+    @NotNull
+    private static Optional<Path> currentUserSettingsPath() {
+        if (!isMavenPluginAvailable()) {
+            return Optional.empty();
+        }
+        return Optional.of(MavenUtil.resolveUserSettingsPath(null, null));
+    }
+
+    @NotNull
+    static Optional<String> resolveCentralMirrorFromSettings(@Nullable final Path settingsFile) {
+        if (settingsFile == null || !Files.exists(settingsFile)) {
+            return Optional.empty();
+        }
+        String mirroredUrl = MavenUtil.INSTANCE.getMirroredUrl(
+                settingsFile, CENTRAL_REPOSITORY_URL, CENTRAL_REPOSITORY_ID);
+        if (mirroredUrl != null && !mirroredUrl.equals(CENTRAL_REPOSITORY_URL)) {
+            return Optional.of(mirroredUrl);
+        }
+        return Optional.empty();
+    }
+
+    @NotNull
+    public static Optional<Path> resolveLocalRepositoryOverride() {
+        return currentUserSettingsPath().flatMap(MavenMirrorUrlResolver::resolveLocalRepositoryFromSettings);
+    }
+
+    @NotNull
+    static Optional<Path> resolveLocalRepositoryFromSettings(@Nullable final Path settingsFile) {
+        if (settingsFile == null || !Files.exists(settingsFile)) {
+            return Optional.empty();
+        }
+        String localRepository = MavenUtil.getRepositoryFromSettings(settingsFile);
+        if (localRepository == null || localRepository.isBlank()) {
+            return Optional.empty();
+        }
+        Path path = Path.of(localRepository);
+        if (!path.isAbsolute()) {
+            LOG.warn("Ignoring relative <localRepository> in " + settingsFile + ": " + localRepository);
+            return Optional.empty();
+        }
+        return Optional.of(path);
+    }
+
+    private static boolean isMavenPluginAvailable() {
+        PluginId pluginId = PluginId.getId(MAVEN_PLUGIN_ID);
+        return PluginManagerCore.isPluginInstalled(pluginId) && !PluginManagerCore.isDisabled(pluginId);
+    }
+}

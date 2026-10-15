@@ -1,0 +1,484 @@
+package org.infernus.idea.checkstyle.model;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
+import com.sun.net.httpserver.HttpServer;
+import org.infernus.idea.checkstyle.TestHelper;
+import org.jetbrains.annotations.NotNull;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
+import java.net.URLConnection;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.UUID;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static java.lang.String.format;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.is;
+import static org.infernus.idea.checkstyle.model.HTTPURLConfigurationLocation.CONTENT_CACHE_SECONDS;
+import static org.infernus.idea.checkstyle.model.HTTPURLConfigurationLocation.FAILURE_CACHE_SECONDS;
+import static org.infernus.idea.checkstyle.model.HTTPURLConfigurationLocation.ONE_SECOND;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+public class HTTPURLConfigurationLocationTest {
+
+    private static final String ETAG = "\"v1\"";
+
+    private final Map<String, AtomicInteger> requestCounts = new ConcurrentHashMap<>();
+
+    private HttpServer httpServer;
+    private int serverPort = -1;
+    private volatile boolean configurationDeleted;
+    private volatile boolean validatorSeenOnRedirectingHop;
+    private volatile boolean validatorSeenOnFinalHop;
+
+    @BeforeEach
+    public void startHttpServer() throws IOException {
+        httpServer = HttpServer.create(new InetSocketAddress(0), 0);
+        httpServer.createContext("/", new TestHandler());
+        httpServer.setExecutor(null);
+        httpServer.start();
+        serverPort = httpServer.getAddress().getPort();
+    }
+
+    @AfterEach
+    public void stopHttpServer() {
+        httpServer.stop(0);
+    }
+
+    @Test
+    public void aRemoteFileCanBeFetched() throws IOException {
+        final InputStream stream = aLocationWithPath("/valid").resolveFile(getClass().getClassLoader());
+
+        assertThat(toString(stream), is("A test response"));
+    }
+
+    @Test
+    public void aRemoteFileCanBeFetchedViaARedirect() throws IOException {
+        final InputStream stream = aLocationWithPath("/redirect").resolveFile(getClass().getClassLoader());
+
+        assertThat(toString(stream), is("A test response"));
+    }
+
+    @Test
+    public void aMissingRemoteFileThrowsAFileNotFoundException() {
+        assertThrows(FileNotFoundException.class,
+                () -> aLocationWithPath("/invalid").resolveFile(getClass().getClassLoader()));
+    }
+
+    @Test
+    public void aTimeoutThrowsASocketTimeoutException() {
+        assertThrows(SocketTimeoutException.class,
+                () -> aTimingOutLocation().resolveFile(getClass().getClassLoader()));
+    }
+
+    @Test
+    public void aFailedFetchIsNotRetriedWithinTheCooldownPeriod() throws IOException {
+        final AtomicInteger connectionAttempts = new AtomicInteger(0);
+        final HTTPURLConfigurationLocation location = new HTTPURLConfigurationLocation(TestHelper.mockProject(), UUID.randomUUID().toString()) {
+            @Override
+            URLConnection connectionTo(final String loc) throws IOException {
+                connectionAttempts.incrementAndGet();
+                throw new IOException("simulated failure");
+            }
+        };
+        location.setDescription("aFailingLocation");
+        location.setLocation("http://localhost:1/does-not-exist");
+
+        assertThrows(IOException.class, () -> location.resolveFile(getClass().getClassLoader()));
+        assertThrows(IOException.class, () -> location.resolveFile(getClass().getClassLoader()));
+
+        assertThat("second call within cooldown should not retry connection", connectionAttempts.get(), is(1));
+    }
+
+    /**
+     * Note: this exercises the fake clock rather than wall-clock time. It could in theory pass
+     * spuriously on a machine slow enough that more than {@code CONTENT_CACHE_SECONDS} of real time
+     * elapsed between the first and second calls.
+     */
+    @Test
+    public void cachedContentExpiresOnceTheCacheTtlElapses() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+
+        location.resolveFile(getClass().getClassLoader());
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat("a call within the TTL should be served from cache", requestsTo("/valid"), is(1));
+
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat("a call after the TTL should hit the server", requestsTo("/valid"), is(2));
+    }
+
+    @Test
+    public void staleCachedContentIsServedWhenTheServerIsUnreachable() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(new ConnectException("simulated network outage"));
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A test response"));
+    }
+
+    @Test
+    public void staleCachedContentIsServedWhileWithinTheFailureCooldownPeriod() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(new ConnectException("simulated network outage"));
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+        final int attemptsAfterFirstFailure = location.connectionAttempts();
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A test response"));
+        assertThat("a call within the cooldown should not retry the connection",
+                location.connectionAttempts(), is(attemptsAfterFirstFailure));
+    }
+
+    @Test
+    public void aMissingRemoteFileThrowsEvenWhenContentIsCached() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/vanishing");
+        location.resolveFile(getClass().getClassLoader());
+
+        configurationDeleted = true;
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+
+        assertThrows(FileNotFoundException.class, () -> location.resolveFile(getClass().getClassLoader()));
+    }
+
+    @Test
+    public void aConditionalRequestIsSentOnRevalidation() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/conditional");
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("An unconditional response"));
+
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A conditional response"));
+    }
+
+    @Test
+    public void aRevalidationReturning304ReusesTheCachedContent() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/revalidated");
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+        assertThat(requestsTo("/revalidated"), is(2));
+
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat("a 304 should extend the cache lifetime", requestsTo("/revalidated"), is(2));
+    }
+
+    @Test
+    public void aRedirectedResourceIsRevalidatedAgainstItsFinalUrl() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/redirect-conditional");
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+        assertThat("the redirecting hop never issued the validator, so must not be sent it",
+                validatorSeenOnRedirectingHop, is(false));
+        assertThat("the hop that issued the validator should be sent it",
+                validatorSeenOnFinalHop, is(true));
+        assertThat(requestsTo("/conditional2"), is(2));
+    }
+
+    @Test
+    public void changingTheLocationDiscardsAnyCachedContent() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A test response"));
+
+        location.setLocation(urlOf("/revalidated"));
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+    }
+
+    @Test
+    public void aRejectedLocationChangeLeavesTheCachedContentIntact() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThrows(IllegalArgumentException.class, () -> location.setLocation(""));
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat(requestsTo("/valid"), is(1));
+    }
+
+    @Test
+    public void reapplyingTheSameLocationLeavesTheCachedContentIntact() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.setLocation(urlOf("/valid"));
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat(requestsTo("/valid"), is(1));
+    }
+
+    @Test
+    public void resettingALocationForcesARevalidation() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/revalidated");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.reset();
+
+        assertThat(toString(location.resolveFile(getClass().getClassLoader())), is("A revalidated response"));
+        assertThat("a reset should contact the server rather than serving the cache",
+                requestsTo("/revalidated"), is(2));
+    }
+
+    @Test
+    public void resettingALocationBypassesTheFailureCooldown() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(new ConnectException("simulated network outage"));
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+        final int attemptsAfterFailure = location.connectionAttempts();
+
+        location.reset();
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat("a reset should retry despite the cooldown",
+                location.connectionAttempts(), is(attemptsAfterFailure + 1));
+    }
+
+    @Test
+    public void goingStaleNotifiesTheUserOncePerOutage() throws IOException {
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(new ConnectException("simulated network outage"));
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat(location.staleNotifications(), is(1));
+
+        location.resolveFile(getClass().getClassLoader());
+        location.advanceBy((FAILURE_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat("further stale serves should be log-only", location.staleNotifications(), is(1));
+    }
+
+    @Test
+    public void aLocationThatRecoversNotifiesAgainIfItGoesStaleOnceMore() throws IOException {
+        final ConnectException outage = new ConnectException("simulated network outage");
+        final FakeClockLocation location = aFakeClockLocationWithPath("/valid");
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(outage);
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(null);
+        location.reset();
+        location.resolveFile(getClass().getClassLoader());
+
+        location.failConnectionsWith(outage);
+        location.advanceBy((CONTENT_CACHE_SECONDS * ONE_SECOND) + 1);
+        location.resolveFile(getClass().getClassLoader());
+
+        assertThat(location.staleNotifications(), is(2));
+    }
+
+    private int requestsTo(final String path) {
+        return requestCounts.getOrDefault(path, new AtomicInteger(0)).get();
+    }
+
+    private String toString(final InputStream is) {
+        Scanner s = new Scanner(is).useDelimiter("\\A");
+        return s.hasNext() ? s.next() : "";
+    }
+
+    @NotNull
+    private HTTPURLConfigurationLocation aLocationWithPath(final String path) {
+        final HTTPURLConfigurationLocation location = new HTTPURLConfigurationLocation(TestHelper.mockProject(), UUID.randomUUID().toString());
+        location.setDescription("aTestLocation");
+        location.setLocation(format("http://localhost:%s%s", serverPort, path));
+        return location;
+    }
+
+    @NotNull
+    private FakeClockLocation aFakeClockLocationWithPath(final String path) {
+        final FakeClockLocation location = new FakeClockLocation();
+        location.setDescription("aTestLocation");
+        location.setLocation(urlOf(path));
+        return location;
+    }
+
+    @NotNull
+    private String urlOf(final String path) {
+        return format("http://localhost:%s%s", serverPort, path);
+    }
+
+    @NotNull
+    private HTTPURLConfigurationLocation aTimingOutLocation() {
+        final TimingOutHTTPURLConfigurationLocation location = new TimingOutHTTPURLConfigurationLocation();
+        location.setDescription("aTimingOutTestLocation");
+        location.setLocation(format("http://localhost:%s%s", serverPort, "/delayed"));
+        location.setNamedScope(TestHelper.NAMED_SCOPE);
+        return location;
+    }
+
+    private final class TestHandler implements HttpHandler {
+        @Override
+        public void handle(final HttpExchange exch) throws IOException {
+            final String path = exch.getRequestURI().getPath();
+            requestCounts.computeIfAbsent(path, ignored -> new AtomicInteger(0)).incrementAndGet();
+
+            String response;
+            int status;
+            switch (path) {
+            case "/valid":
+                response = "A test response";
+                status = 200;
+                break;
+            case "/redirect-conditional":
+                validatorSeenOnRedirectingHop |= exch.getRequestHeaders().containsKey("If-None-Match");
+                response = "A redirect";
+                status = 301;
+                exch.getResponseHeaders().add("Location", urlOf("/conditional2"));
+                break;
+            case "/conditional2":
+                validatorSeenOnFinalHop |= exch.getRequestHeaders().containsKey("If-None-Match");
+                // falls through to the shared revalidation handling
+            case "/revalidated":
+                if (ETAG.equals(exch.getRequestHeaders().getFirst("If-None-Match"))) {
+                    // a 304 must carry no body at all, or com.sun.net.httpserver will reject it
+                    exch.sendResponseHeaders(304, -1);
+                    exch.close();
+                    return;
+                }
+                exch.getResponseHeaders().add("ETag", ETAG);
+                response = "A revalidated response";
+                status = 200;
+                break;
+            case "/conditional":
+                exch.getResponseHeaders().add("ETag", ETAG);
+                response = exch.getRequestHeaders().containsKey("If-None-Match")
+                        ? "A conditional response"
+                        : "An unconditional response";
+                status = 200;
+                break;
+            case "/vanishing":
+                response = configurationDeleted ? "" : "A test response";
+                status = configurationDeleted ? 404 : 200;
+                break;
+            case "/delayed":
+                waitFor();
+                response = "A delayed test response";
+                status = 200;
+                break;
+            case "/redirect":
+                response = "A redirect";
+                status = 301;
+                exch.getResponseHeaders().add("Location", format("http://localhost:%s/valid", serverPort));
+                break;
+            default:
+                response = "";
+                status = 404;
+            }
+
+            exch.sendResponseHeaders(status, response.length());
+            OutputStream os = exch.getResponseBody();
+            os.write(response.getBytes());
+            os.close();
+        }
+
+        private void waitFor() {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    }
+
+    /**
+     * A location whose clock is driven by the test rather than by wall-clock time. The clock starts
+     * at a nonzero value so that the initial zeroed expiry fields cannot compare as unexpired.
+     */
+    private static class FakeClockLocation extends HTTPURLConfigurationLocation {
+        private final AtomicInteger connectionAttempts = new AtomicInteger(0);
+        private final AtomicInteger staleNotifications = new AtomicInteger(0);
+
+        private long time = 1_000_000L;
+        private IOException connectionFailure;
+
+        FakeClockLocation() {
+            super(TestHelper.mockProject(), UUID.randomUUID().toString());
+        }
+
+        @Override
+        long now() {
+            return time;
+        }
+
+        void advanceBy(final long millis) {
+            time += millis;
+        }
+
+        @NotNull
+        @Override
+        URLConnection connectionTo(final String location) throws IOException {
+            connectionAttempts.incrementAndGet();
+            if (connectionFailure != null) {
+                throw connectionFailure;
+            }
+            return super.connectionTo(location);
+        }
+
+        void failConnectionsWith(final IOException failure) {
+            this.connectionFailure = failure;
+        }
+
+        int connectionAttempts() {
+            return connectionAttempts.get();
+        }
+
+        @Override
+        void notifyOfStaleContent() {
+            staleNotifications.incrementAndGet();
+        }
+
+        int staleNotifications() {
+            return staleNotifications.get();
+        }
+    }
+
+    private static class TimingOutHTTPURLConfigurationLocation extends HTTPURLConfigurationLocation {
+        TimingOutHTTPURLConfigurationLocation() {
+            super(TestHelper.mockProject(), UUID.randomUUID().toString());
+        }
+
+        @NotNull
+        @Override
+        URLConnection connectionTo(final String location) throws IOException {
+            final URLConnection urlConnection = super.connectionTo(location);
+            urlConnection.setConnectTimeout(1);
+            urlConnection.setReadTimeout(1);
+            return urlConnection;
+        }
+    }
+
+
+}

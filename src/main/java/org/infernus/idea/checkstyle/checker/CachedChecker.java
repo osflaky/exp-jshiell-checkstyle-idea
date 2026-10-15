@@ -1,0 +1,46 @@
+package org.infernus.idea.checkstyle.checker;
+
+import org.jetbrains.annotations.NotNull;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Value for checker cache.
+ */
+class CachedChecker {
+
+    /**
+     * We cache purely to ignore repeated requests in a multi-file scan. Hence we'll treat the cached
+     * value as valid for time in ms.
+     */
+    private static final int CACHE_VALID_TIME = 60000;
+
+    private final CheckStyleChecker checkStyleChecker;
+    private final AtomicBoolean destroyed = new AtomicBoolean(false);
+
+    private long timeStamp;
+
+    CachedChecker(@NotNull final CheckStyleChecker checkStyleChecker) {
+        this.checkStyleChecker = checkStyleChecker;
+        this.timeStamp = System.currentTimeMillis();
+    }
+
+    public CheckStyleChecker getCheckStyleChecker() {
+        this.timeStamp = System.currentTimeMillis();
+        return checkStyleChecker;
+    }
+
+    private long getTimeStamp() {
+        return timeStamp;
+    }
+
+    public boolean isValid() {
+        return (getTimeStamp() + CACHE_VALID_TIME) >= System.currentTimeMillis();
+    }
+
+    public void destroy() {
+        if (destroyed.compareAndSet(false, true)) {
+            checkStyleChecker.destroy();
+        }
+    }
+}

@@ -1,0 +1,74 @@
+package org.infernus.idea.checkstyle;
+
+import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.options.Configurable;
+import com.intellij.openapi.project.Project;
+import org.infernus.idea.checkstyle.config.PluginConfiguration;
+import org.infernus.idea.checkstyle.config.PluginConfigurationManager;
+import org.infernus.idea.checkstyle.ui.CheckStyleConfigPanel;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+
+
+/**
+ * The "configurable component" required by IntelliJ IDEA to provide a Swing form for inclusion into the 'Settings'
+ * dialog. Registered in {@code plugin.xml} as a {@code projectConfigurable} extension.
+ */
+public class CheckStyleConfigurable implements Configurable {
+    private static final Logger LOG = Logger.getInstance(CheckStyleConfigurable.class);
+
+    private final CheckStyleConfigPanel configPanel;
+    private final PluginConfigurationManager pluginConfigurationManager;
+    private final ConfigurationInvalidator configurationInvalidator;
+
+    CheckStyleConfigurable(@NotNull final Project project) {
+        this.pluginConfigurationManager = project.getService(PluginConfigurationManager.class);
+        this.configurationInvalidator = project.getService(ConfigurationInvalidator.class);
+
+        this.configPanel = new CheckStyleConfigPanel(project);
+    }
+
+    public String getDisplayName() {
+        return CheckStyleBundle.message("plugin.configuration-name");
+    }
+
+    public String getHelpTopic() {
+        return null;
+    }
+
+    public JComponent createComponent() {
+        reset();
+        return configPanel;
+    }
+
+    @Override
+    public boolean isModified() {
+        final PluginConfiguration oldConfig = pluginConfigurationManager.getCurrent();
+
+        boolean modified = oldConfig.hasChangedFrom(configPanel.getPluginConfiguration());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Has config changed? " + modified);
+        }
+        return modified;
+    }
+
+    public void apply() {
+        final PluginConfiguration newConfig = configPanel.getPluginConfiguration();
+        pluginConfigurationManager.setCurrent(newConfig, true);
+        configPanel.markAsApplied(newConfig);
+
+        configurationInvalidator.invalidateCachedResources();
+    }
+
+    public void reset() {
+        final PluginConfiguration pluginConfig = pluginConfigurationManager.getCurrent();
+        configPanel.showPluginConfiguration(pluginConfig);
+
+        configurationInvalidator.invalidateCachedResources();
+    }
+
+    public void disposeUIResources() {
+        // do nothing
+    }
+}
